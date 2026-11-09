@@ -39,8 +39,38 @@ fi
 executable="$app_dir/dsh-desktop"
 
 if [ -f "$app_dir/chrome-sandbox" ]; then
-  chown root:root "$app_dir/chrome-sandbox" 2>/dev/null || true
-  chmod 4755 "$app_dir/chrome-sandbox" 2>/dev/null || true
+  # The package still installs when these fail, so say what breaks instead of
+  # leaving a silent "No usable sandbox!" for the first launch.
+  if ! chown root:root "$app_dir/chrome-sandbox" 2>/dev/null; then
+    echo "dsh-desktop: warning: could not make $app_dir/chrome-sandbox root-owned; Chromium's SUID sandbox may be unavailable" >&2
+  fi
+  if ! chmod 4755 "$app_dir/chrome-sandbox" 2>/dev/null; then
+    echo "dsh-desktop: warning: could not set the setuid bit on $app_dir/chrome-sandbox; Chromium's SUID sandbox may be unavailable" >&2
+  fi
+fi
+
+# `deb.afterInstall` replaces electron-builder's default postinst rather than
+# extending it, so the entries that template provided are restored here: the
+# /usr/bin link the documentation advertises and the desktop/mime caches.
+link_name=dsh-desktop
+link_path="/usr/bin/$link_name"
+if command -v update-alternatives >/dev/null 2>&1; then
+  # A symlink from an older install is not managed by update-alternatives and
+  # would make the registration fail.
+  if [ -L "$link_path" ] && [ -e "$link_path" ] &&
+     [ "$(readlink "$link_path")" != "/etc/alternatives/$link_name" ]; then
+    rm -f "$link_path" 2>/dev/null || true
+  fi
+  update-alternatives --install "$link_path" "$link_name" "$executable" 100 >/dev/null 2>&1 || true
+else
+  ln -sf "$executable" "$link_path" 2>/dev/null || true
+fi
+
+if command -v update-desktop-database >/dev/null 2>&1; then
+  update-desktop-database /usr/share/applications >/dev/null 2>&1 || true
+fi
+if command -v update-mime-database >/dev/null 2>&1; then
+  update-mime-database /usr/share/mime >/dev/null 2>&1 || true
 fi
 
 # Without AppArmor, or without the 4.0 ABI that knows the `userns` rule, there is
@@ -52,10 +82,11 @@ if [ ! -x "$executable" ] || [ ! -d /etc/apparmor.d ] || [ ! -f /etc/apparmor.d/
 fi
 
 template="$app_dir/resources/dsh-desktop.apparmor"
+rm -f "$profile_path" 2>/dev/null || true
 if [ -f "$template" ]; then
-  sed "s|@EXECUTABLE@|$executable|g" "$template" > "$profile_path" 2>/dev/null || exit 0
+  { sed "s|@EXECUTABLE@|$executable|g" "$template" > "$profile_path"; } 2>/dev/null || true
 else
-  cat > "$profile_path" 2>/dev/null <<EOF || exit 0
+  { cat > "$profile_path" <<EOF
 abi <abi/4.0>,
 include <tunables/global>
 
@@ -65,13 +96,21 @@ profile $profile_name "$executable" flags=(unconfined) {
   include if exists <local/$profile_name>
 }
 EOF
+  } 2>/dev/null || true
+fi
+
+if [ ! -s "$profile_path" ]; then
+  echo "dsh-desktop: warning: could not write $profile_path; Chromium may fall back to the SUID sandbox" >&2
+  exit 0
 fi
 
 chmod 0644 "$profile_path" 2>/dev/null || true
 
 if command -v apparmor_parser >/dev/null 2>&1; then
   # -W writes the compiled cache; -r reloads a profile that is already loaded.
-  apparmor_parser -r -W "$profile_path" >/dev/null 2>&1 || true
+  if ! apparmor_parser -r -W "$profile_path" >/dev/null 2>&1; then
+    echo "dsh-desktop: warning: apparmor_parser could not load $profile_path; Chromium may fall back to the SUID sandbox" >&2
+  fi
 fi
 
 exit 0
